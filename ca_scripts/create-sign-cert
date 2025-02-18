@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+# create-sign-cert - create certs signed by a certificate authority (which were created with create-sign-ca-keys)
+# Copyright (C) 2024  Ira Peach
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for more
+# details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+ca_dir="$1"
+dir="$2"
+subject_suffix="$3"
+
+if [[ -z $dir ]] || [[ -z $subject_suffix ]]; then
+    echo "usage: $(basename "$0") CA_DIR CERT_DIR SUBJECT_SUFFIX" >&2
+    echo "" >&2
+    echo "example: $(basename "$0") /usr/local/etc/ssl/ca.example.lan /usr/local/etc/ssl/example.lan 'O=My Org/C=MyCountry'" >&2
+    exit 1
+fi
+
+# there may be two openssl binaries...
+openssl="/usr/bin/openssl"
+
+dir="$(realpath "$dir")"
+
+ca_dir="$(realpath "$ca_dir")"
+ca_domain="$(basename "$ca_dir")"
+ca_public_key="$ca_dir/$ca_domain.crt"
+ca_private_key="$ca_dir/$ca_domain.key"
+
+domain="$(basename "$dir")"
+public_csr="$domain.csr"
+public_key="$domain.crt"
+public_key_chain="$domain.chain.crt"
+private_key="$domain.key"
+public_key_chain="$domain.chain.crt"
+private_key="$domain.key"
+openssl_config="$domain.cnf"
+subject="/CN=$domain/$subject_suffix"
+expiry_days="365"
+
+# Don't use any openssl config to muck up openssl invocations
+export OPENSSL_CONF=""
+
+mkdir -p "$dir" &&
+pushd "$dir" >/dev/null &&
+
+cat <<EOF>"$openssl_config" &&
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = req_ext
+prompt = no
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = $domain
+DNS.2 = *.$domain
+EOF
+
+if [ ! -f "$private_key" ]; then
+    echo "note: Private key does not exist; creating new private key '$private_key'" &&
+    "$openssl" ecparam -out "$private_key" -name secp521r1 -genkey
+    echo ""
+fi &&
+echo "note: Creating new CSR '$public_csr' with private key '$private_key' for subject '$subject'" &&
+"$openssl" req -new -key "$private_key" -out "$public_csr" -subj "$subject" -addext "subjectAltName = DNS:$domain, DNS:*.$domain" &&
+echo "" &&
+
+echo "note: Signing CSR '$public_csr' with CA public key '$ca_public_key' and CA private key '$ca_private_key', output '$public_key' (using config '$openssl_config')" &&
+OPENSSL_CONF="$openssl_config" "$openssl" x509 -req -copy_extensions copyall -ext subjectAltName,subjectKeyIdentifier -in "$public_csr" -CA "$ca_public_key" -CAkey "$ca_private_key" -out "$public_key" -days "$expiry_days" &&
+echo "" &&
+
+echo "note: Creating full chain with '$public_key' and '$ca_public_key', output '$public_key_chain'" &&
+cat "$public_key" "$ca_public_key" > "$public_key_chain" || exit 1
+echo ""
+
+set -x
+echo "note: Verifying public key '$public_key' using CA public key '$ca_public_key'"
+"$openssl" verify -x509_strict -CAfile "$ca_public_key" "$public_key"
+echo ""
+
+echo "note: Verifying public key full chain '$public_key_chain' using CA public key '$ca_public_key'"
+"$openssl" verify -x509_strict -CAfile "$ca_public_key" "$public_key_chain"
+echo ""
+set +x
+
+"$openssl" x509 -noout -in "$public_key_chain" -text &&
+cat <<EOF>"create-sign-cert.sh" &&
+#!/bin/sh
+
+create-sign-cert '$ca_dir' '$dir' '$subject_suffix'
+EOF
+chmod 755 "create-sign-cert.sh"
